@@ -1,1 +1,2 @@
 # Dependencies will be added later as the project grows.
+python-dotenv==1.0.1
