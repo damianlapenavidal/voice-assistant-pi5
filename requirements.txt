@@ -1,2 +1,4 @@
 # Dependencies will be added later as the project grows.
 python-dotenv==1.0.1
+openai==1.82.0
+websockets==15.0.1
