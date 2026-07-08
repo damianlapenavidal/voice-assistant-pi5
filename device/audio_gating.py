@@ -18,7 +18,10 @@ CHUNK_BYTES = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * CHUNK_MS // 1000
 DEFAULT_QUIET_SEC = 1.0
 DEFAULT_SPEAK_SEC = 10.0
 SPEAK_SILENCE_CHUNKS_TO_FINISH = 5
-POST_PROMPT_GRACE_CHUNKS = 6
+# Chunks (100 ms each) of mic audio discarded at the very start of the speak
+# phase. Combined with the client's post-prompt settle delay, this keeps the
+# prompt's speaker tail from being mistaken for the user's hello.
+POST_PROMPT_GRACE_CHUNKS = 8
 MIN_SPEECH_CHUNKS = 2
 MIN_VOICE_ABOVE_NOISE = 50.0
 

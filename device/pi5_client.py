@@ -59,6 +59,9 @@ MAX_RECONNECT_ATTEMPTS = 5
 MAX_CALIBRATION_RETRIES = 5
 MIN_PROMPT_PCM_BYTES = 4000
 INITIAL_BACKOFF_SECONDS = 1.0
+# Silence enforced after the "say hello to start" prompt finishes playing, so
+# the speaker buffer + acoustic tail decay before the mic starts listening.
+PROMPT_SETTLE_SEC = 0.6
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -230,8 +233,6 @@ class Pi5Client:
         self._mic_muted = False
         self._calibration_playing_prompt = False
         self._calibration_retries = 0
-        self._calibration_speech_buffer: list[bytes] = []
-        self._calibration_speech_forwarded = False
         self._stream_to_laptop = False
 
     async def run(self) -> None:
@@ -355,7 +356,7 @@ class Pi5Client:
             payload = msg.get("payload", {})
 
             if msg_type == "START_AUDIO_STREAM":
-                await self._start_audio(ws)
+                await self._start_audio(ws, payload)
 
             elif msg_type == "STOP_AUDIO_STREAM":
                 await self._stop_audio()
@@ -374,7 +375,6 @@ class Pi5Client:
 
             elif msg_type == "UNMUTE_MIC":
                 self._mic_muted = False
-                await self._flush_calibration_speech(ws)
                 self._stream_to_laptop = True
                 logger.info("Mic unmuted — streaming to laptop enabled")
 
@@ -394,11 +394,18 @@ class Pi5Client:
             else:
                 logger.warning("Unknown message type: %s", msg_type)
 
-    async def _start_audio(self, ws) -> None:
-        """Start microphone capture and stream AUDIO_FRAME messages."""
+    async def _start_audio(self, ws, payload: dict | None = None) -> None:
+        """Start microphone capture and stream AUDIO_FRAME messages.
+
+        When the app sends ``skip_calibration: true`` (a resume of a paused
+        session) the device must NOT re-run calibration — no prompt, no
+        re-measuring — and should begin streaming live audio immediately.
+        """
         if self.is_recording:
             logger.debug("Audio stream already active")
             return
+
+        skip_calibration = bool((payload or {}).get("skip_calibration", False))
 
         try:
             await self._audio_capture.start()
@@ -410,12 +417,20 @@ class Pi5Client:
         self.is_recording = True
         self._sequence_number = 0
         self._calibration_retries = 0
-        self._calibration_speech_buffer = []
-        self._calibration_speech_forwarded = False
-        self._audio_gating.start_calibration()
-        await ws.send(make_calibration_status("quiet"))
+        self._mic_muted = False
+
+        if skip_calibration:
+            # Resume: levels are already known on the app side. Stream live
+            # audio straight away instead of replaying "say hello to start".
+            self._stream_to_laptop = True
+            logger.info("Audio streaming resumed (skip_calibration) — no prompt")
+        else:
+            self._stream_to_laptop = False
+            self._audio_gating.start_calibration()
+            await ws.send(make_calibration_status("quiet"))
+            logger.info("Audio streaming started with calibration (%d-byte chunks)", CHUNK_BYTES)
+
         self._audio_task = asyncio.create_task(self._audio_stream_loop(ws))
-        logger.info("Audio streaming started (%d-byte chunks)", CHUNK_BYTES)
 
     async def _stop_audio(self) -> None:
         """Stop capture task and terminate arecord."""
@@ -454,9 +469,6 @@ class Pi5Client:
                     if self._calibration_playing_prompt:
                         continue
 
-                    if self._audio_gating.calibration_phase == CalibrationPhase.SPEAK:
-                        self._calibration_speech_buffer.append(chunk)
-
                     step = self._audio_gating.process_calibration_chunk(chunk)
                     if step == CalibrationStep.PLAY_PROMPT:
                         if not await self._play_calibration_prompt(ws):
@@ -466,20 +478,18 @@ class Pi5Client:
                                 "Could not play calibration prompt on speaker",
                             )
                     elif step == CalibrationStep.SPEECH_TIMEOUT:
-                        self._calibration_speech_buffer = []
                         await self._retry_calibration_prompt(ws)
                     elif step == CalibrationStep.COMPLETE:
+                        # Report levels only. We deliberately do NOT forward the
+                        # captured hello audio: the app greets first and then
+                        # listens live, so replaying calibration audio would just
+                        # inject the prompt tail / a stale "hello" into the chat.
                         metrics = self._audio_gating.calibration_payload()
-                        hello_pcm = b"".join(self._calibration_speech_buffer)
-                        if hello_pcm:
-                            metrics["hello_audio"] = base64.b64encode(
-                                hello_pcm,
-                            ).decode("ascii")
                         await ws.send(make_calibration_complete(metrics))
                         logger.info(
-                            "Calibration complete — buffered %d bytes of hello audio "
-                            "(will forward on UNMUTE_MIC)",
-                            len(hello_pcm),
+                            "Calibration complete — noise=%.0f voice=%.0f",
+                            metrics.get("noise_floor", 0.0),
+                            metrics.get("user_speech_peak", 0.0),
                         )
                     continue
 
@@ -524,6 +534,11 @@ class Pi5Client:
             )
             await self._playback.play_pcm16_chunk(pcm, is_final=True)
             logger.info("Calibration prompt finished")
+            # Let the speaker's ALSA buffer and the room's acoustic tail fully
+            # decay before we start listening. Without this the mic captures
+            # the prompt's own "...to start" tail and treats it as the user's
+            # hello — calibration then "completes" even in total silence.
+            await asyncio.sleep(PROMPT_SETTLE_SEC)
         except (PlaybackError, RuntimeError, OSError) as exc:
             logger.error("Calibration prompt playback failed: %s", exc)
             await ws.send(make_error("SPEAKER_ERROR", str(exc), recoverable=True))
@@ -553,8 +568,6 @@ class Pi5Client:
             MAX_CALIBRATION_RETRIES,
         )
         await ws.send(make_calibration_status("retry"))
-        self._calibration_speech_buffer = []
-        self._calibration_speech_forwarded = False
         self._audio_gating.reset_for_prompt_retry()
         if not await self._play_calibration_prompt(ws):
             await self._fail_calibration(
@@ -563,36 +576,10 @@ class Pi5Client:
                 "Could not replay calibration prompt on speaker",
             )
 
-    async def _flush_calibration_speech(self, ws) -> None:
-        """Send buffered calibration hello as AUDIO_FRAME when the mic opens."""
-        if self._calibration_speech_forwarded or not self._calibration_speech_buffer:
-            return
-
-        hello_pcm = b"".join(self._calibration_speech_buffer)
-        self._calibration_speech_buffer = []
-        self._calibration_speech_forwarded = True
-
-        frames = 0
-        for offset in range(0, len(hello_pcm), CHUNK_BYTES):
-            chunk = hello_pcm[offset:offset + CHUNK_BYTES]
-            self._sequence_number += 1
-            await ws.send(
-                make_audio_frame(chunk, self._sequence_number),
-            )
-            frames += 1
-
-        logger.info(
-            "Forwarded calibration hello: %d bytes in %d AUDIO_FRAME(s)",
-            len(hello_pcm),
-            frames,
-        )
-
     async def _fail_calibration(self, ws, code: str, message: str) -> None:
         """Abort calibration and stop the audio stream."""
         logger.error("Calibration failed: %s", message)
         self._audio_gating.cancel_calibration()
-        self._calibration_speech_buffer = []
-        self._calibration_speech_forwarded = False
         await ws.send(make_error(code, message, recoverable=True))
         await self._stop_audio()
 
