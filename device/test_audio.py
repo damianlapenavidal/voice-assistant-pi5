@@ -271,31 +271,60 @@ async def _test_streaming_finalize_with_empty_final_chunk():
     print("  PASS: test_streaming_finalize_with_empty_final_chunk")
 
 
-async def _test_flush_calibration_speech():
-    """Buffered calibration hello is sent as AUDIO_FRAME on UNMUTE_MIC."""
+async def _test_skip_calibration_streams_immediately():
+    """START_AUDIO_STREAM with skip_calibration bypasses the prompt (resume)."""
     from pi5_client import Pi5Client
 
     client = Pi5Client("ws://test")
-    client._calibration_speech_buffer = [b"\x00" * CHUNK_BYTES, b"\x01" * 100]
-    client._sequence_number = 0
 
     sent: list[dict] = []
     ws = MagicMock()
     ws.send = AsyncMock(side_effect=lambda msg: sent.append(json.loads(msg)))
 
-    await client._flush_calibration_speech(ws)
+    started = {"value": False}
 
-    assert len(sent) == 2
-    assert sent[0]["type"] == "AUDIO_FRAME"
-    assert sent[0]["payload"]["sequence_number"] == 1
-    assert sent[1]["payload"]["sequence_number"] == 2
-    assert client._calibration_speech_forwarded
-    assert client._calibration_speech_buffer == []
+    async def fake_start():
+        started["value"] = True
 
-    await client._flush_calibration_speech(ws)
-    assert len(sent) == 2
+    client._audio_capture.start = AsyncMock(side_effect=fake_start)
 
-    print("  PASS: test_flush_calibration_speech")
+    await client._start_audio(ws, {"skip_calibration": True})
+
+    # No calibration prompt / status when resuming; stream live immediately.
+    assert started["value"] is True
+    assert client.is_recording is True
+    assert client._stream_to_laptop is True
+    assert client._audio_gating.is_calibrating is False
+    assert not any(m["type"] == "CALIBRATION_STATUS" for m in sent)
+
+    await client._stop_audio()
+    print("  PASS: test_skip_calibration_streams_immediately")
+
+
+async def _test_fresh_start_runs_calibration():
+    """START_AUDIO_STREAM without skip_calibration begins calibration."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+
+    sent: list[dict] = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda msg: sent.append(json.loads(msg)))
+
+    client._audio_capture.start = AsyncMock()
+
+    await client._start_audio(ws, None)
+
+    assert client.is_recording is True
+    assert client._stream_to_laptop is False
+    assert client._audio_gating.is_calibrating is True
+    assert any(
+        m["type"] == "CALIBRATION_STATUS" and m["payload"].get("phase") == "quiet"
+        for m in sent
+    )
+
+    await client._stop_audio()
+    print("  PASS: test_fresh_start_runs_calibration")
 
 
 def run_async_test(coro):
@@ -316,7 +345,8 @@ def main():
         _test_single_blob_still_works,
         _test_finalize_returns_correct_duration,
         _test_streaming_finalize_with_empty_final_chunk,
-        _test_flush_calibration_speech,
+        _test_skip_calibration_streams_immediately,
+        _test_fresh_start_runs_calibration,
     ]
 
     total = len(sync_tests) + len(async_tests)
