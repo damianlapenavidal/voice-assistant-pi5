@@ -546,6 +546,18 @@ class Pi5Client:
         finally:
             self._calibration_playing_prompt = False
 
+        # The mic kept recording (including the prompt's own echo) the entire
+        # time we were blocked playing it. Drop that backlog so the speak phase
+        # only evaluates fresh, real-time audio — otherwise the buffered echo is
+        # replayed in a burst and instantly "completes" calibration on silence.
+        discarded = await self._audio_capture.drain_buffered_audio()
+        if discarded:
+            logger.info(
+                "Discarded %d bytes (~%.1fs) of buffered mic audio before listening",
+                discarded,
+                discarded / (24000 * 2),
+            )
+
         await ws.send(make_calibration_status("speak"))
         self._audio_gating.begin_speak_phase()
         return True
