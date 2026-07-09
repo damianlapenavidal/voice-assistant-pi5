@@ -101,6 +101,37 @@ class AudioCapture:
             self._running = False
             return None
 
+    async def drain_buffered_audio(self, max_drain_sec: float = 1.5) -> int:
+        """Discard audio that piled up while nobody was reading the mic.
+
+        ``arecord`` keeps capturing into its pipe even while the audio loop is
+        busy elsewhere — notably while the calibration prompt plays through the
+        speaker. That backlog contains the prompt's own acoustic echo, and if it
+        were fed to the calibrator it would be replayed in a burst and mistaken
+        for the user's hello. Read and throw it away until reads start blocking,
+        i.e. we've caught up to real time. Returns the number of bytes dropped.
+        """
+        if not self.is_running or self._process is None or self._process.stdout is None:
+            return 0
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max_drain_sec
+        discarded = 0
+        while loop.time() < deadline:
+            try:
+                data = await asyncio.wait_for(
+                    self._process.stdout.read(CHUNK_BYTES),
+                    timeout=0.05,
+                )
+            except asyncio.TimeoutError:
+                # No data within 50 ms → the backlog is gone and fresh audio is
+                # now arriving at real-time cadence. We're caught up.
+                break
+            if not data:
+                break
+            discarded += len(data)
+        return discarded
+
     async def _read_stderr(self) -> str:
         if self._process is None or self._process.stderr is None:
             return ""

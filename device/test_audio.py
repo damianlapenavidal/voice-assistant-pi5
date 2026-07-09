@@ -327,6 +327,42 @@ async def _test_fresh_start_runs_calibration():
     print("  PASS: test_fresh_start_runs_calibration")
 
 
+async def _test_drain_buffered_audio_discards_backlog():
+    """drain_buffered_audio() drops piled-up mic bytes, then stops once reads block.
+
+    Reproduces the calibration echo bug: while the prompt plays, arecord keeps
+    filling its pipe. That backlog must be dropped before the speak phase so it
+    is not replayed in a burst and mistaken for the user's hello.
+    """
+    fake_stdout = asyncio.StreamReader()
+    backlog = b"\x11" * (CHUNK_BYTES * 2 + 100)
+    fake_stdout.feed_data(backlog)
+    # Deliberately no feed_eof(): after the backlog is read, the next read
+    # blocks — mimicking real-time capture — so drain should time out and stop.
+
+    fake_process = MagicMock()
+    fake_process.returncode = None
+    fake_process.stdout = fake_stdout
+    fake_process.stderr = asyncio.StreamReader()
+
+    capture = AudioCapture()
+    capture._process = fake_process
+    capture._running = True
+
+    discarded = await capture.drain_buffered_audio(max_drain_sec=1.0)
+    assert discarded == len(backlog), discarded
+
+    print("  PASS: test_drain_buffered_audio_discards_backlog")
+
+
+async def _test_drain_buffered_audio_noop_when_idle():
+    """drain_buffered_audio() returns 0 when capture is not running."""
+    capture = AudioCapture()
+    assert await capture.drain_buffered_audio() == 0
+
+    print("  PASS: test_drain_buffered_audio_noop_when_idle")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -347,6 +383,8 @@ def main():
         _test_streaming_finalize_with_empty_final_chunk,
         _test_skip_calibration_streams_immediately,
         _test_fresh_start_runs_calibration,
+        _test_drain_buffered_audio_discards_backlog,
+        _test_drain_buffered_audio_noop_when_idle,
     ]
 
     total = len(sync_tests) + len(async_tests)
