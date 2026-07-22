@@ -88,7 +88,7 @@ def get_device_id() -> str:
 
 
 def load_device_env() -> None:
-    """Load optional .env from the device/ directory (does not override existing env)."""
+    """Load optional .env from this repo's root (does not override existing env)."""
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.is_file():
         return

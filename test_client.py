@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-# Add device/ to path so we can import pi5_client
+# Add this directory to path so we can import pi5_client
 sys.path.insert(0, str(Path(__file__).parent))
 
 from pi5_client import (

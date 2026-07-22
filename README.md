@@ -1,106 +1,158 @@
-# Voice Assistant (Raspberry Pi 5)
+# Voice Assistant (Raspberry Pi 5) — Thin Client
 
-Live voice assistant for Raspberry Pi 5: USB microphone → OpenAI Realtime API → USB speaker.
+A lightweight WebSocket client that runs on the Raspberry Pi 5 and connects to
+`voice-assistant-app` on your laptop. The Pi is a **thin client**: it captures
+microphone audio, plays back AI-generated speech relayed from the laptop, runs
+mic calibration/gating, and reports device status. No API keys and no Realtime
+logic live on the device — that intelligence stays on the laptop app.
 
-## Current stage
+## How it fits in the system
 
-**Working end-to-end on Pi 5.** The main script streams your voice to the Realtime API, plays the assistant’s reply on the speaker, then waits for the room to quiet before listening again.
+```
+┌─────────────┐         WebSocket (Wi-Fi)          ┌──────────────────────┐
+│  Raspberry  │ ───────────────────────────────────▶│  voice-assistant-app │
+│    Pi 5     │◀─────────────────────────────────── │      (Laptop)        │
+│ (this repo) │   HELLO, DEVICE_STATUS,              │                      │
+│             │   AUDIO_FRAME, PLAY_AUDIO            │  → OpenAI Realtime   │
+└─────────────┘                                      └──────────────────────┘
+```
 
-What works today:
-
-- Live voice conversations with `gpt-realtime-mini` (default) over WebSocket
-- USB mic/speaker via ALSA (`arecord` / `aplay`), with auto-detected devices
-- Startup calibration (stay quiet, then speak) so speech thresholds fit your room
-- Echo protection: mic is ignored while the assistant is speaking and during a short recovery period afterward
-- Colored terminal output grouped by turn (`assistant_ui.py`)
-
-Not included (by design):
-
-- **Interrupting the assistant mid-reply** — removed after testing showed speaker echo on this hardware is louder than the user’s voice at the mic, so reliable voice barge-in would need acoustic echo cancellation or different hardware.
-
-See [speaker_mic_set_up.md](speaker_mic_set_up.md) for ALSA card numbers, volume levels, and device overrides.
+The Pi connects **as a client** to the laptop's WebSocket server. The laptop
+owns all intelligence: API keys, session management, parent controls. This
+device reports `device_type: "pi5"`.
 
 ## Project structure
 
 ```
-voice-assistant/
-├── src/
-│   ├── main.py              # Startup sanity test + .env load check
-│   ├── verify_api.py        # Verify OpenAI API key (REST)
-│   ├── realtime_connect.py  # Realtime API WebSocket text test (no mic)
-│   ├── check_audio.py       # List mic/speaker + record/playback test
-│   ├── voice_assistant.py   # Main loop: mic → Realtime API → speaker
-│   ├── assistant_audio.py   # Mic modes, thresholds, playback (aplay)
-│   └── assistant_ui.py      # Colored terminal output
-├── speaker_mic_set_up.md    # Pi 5 mic/speaker volume and ALSA notes
-├── .env                     # Your API key (local only, not in Git)
-├── .env.example             # Template for env vars
-├── requirements.txt
-└── README.md
+pi5_client.py          # entrypoint: WebSocket client, handshake, main loop
+audio_capture.py        # arecord-backed mic capture
+audio_playback.py       # aplay-backed speaker playback
+audio_gating.py         # calibration thresholds, echo/mic gating
+calibration_prompt.py   # "say hello to start" prompt playback
+assets/                 # calibration prompt audio asset
+test_client.py           # protocol/message unit tests (no hardware)
+test_audio.py             # audio pipeline unit tests (no hardware)
+requirements.txt
+.env.example
+speaker_mic_set_up.md    # USB mic/speaker ALSA card numbers and volume notes
 ```
 
-## Setup
+## Audio hardware configuration
+
+Audio capture and playback use `arecord` and `aplay` (from `alsa-utils`) at
+**24 kHz, PCM16, mono**.
+
+Optional environment variables select ALSA devices:
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `AUDIO_INPUT_DEVICE` | `plughw:2,0` | Microphone device for `arecord` |
+| `AUDIO_OUTPUT_DEVICE` | `plughw:3,0` | Speaker device for `aplay` |
+
+Mic and speaker are often **different ALSA cards** when using separate USB
+devices. On this Pi 5, the mic is card 2 and the USB speaker is card 3 — do not
+use `plughw:0,0` unless that is your actual speaker (`aplay -l`). See
+[speaker_mic_set_up.md](speaker_mic_set_up.md) for card numbers and volume
+commands.
+
+Copy `.env.example` to `.env`; `pi5_client.py` loads it automatically on
+startup.
 
 ```bash
-cd ~/voice-assistant
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+arecord -l   # input devices
+aplay -l     # output devices
 ```
 
-Copy `.env.example` to `.env` and set your `OPENAI_API_KEY`.
+Use the `plughw:` prefix for plug-in conversion (recommended). If unset, ALSA
+uses the system default device.
 
-## Run the checks
-
-**1. Sanity test (run first):**
+## Install
 
 ```bash
-python src/main.py
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt        # websockets only
+cp .env.example .env                   # edit if your card numbers differ
 ```
 
-**2. Verify API key (REST):**
+## Finding the laptop's IP address
+
+On the laptop running `voice-assistant-app`:
+
+**macOS:** `ipconfig getifaddr en0`
+**Linux:** `hostname -I | awk '{print $1}'`
+
+Both devices must be on the same Wi-Fi network.
+
+## Running the client
 
 ```bash
-python src/verify_api.py
+python pi5_client.py ws://LAPTOP_IP:8765
+python pi5_client.py ws://192.168.1.42:8765 --debug   # verbose
 ```
 
-**3. Realtime API WebSocket test (text only, no mic):**
+On a successful connection:
+
+```
+2026-06-30 15:00:00 [INFO] Pi 5 Voice Assistant Client v0.1.0
+2026-06-30 15:00:00 [INFO] Device ID: raspberrypi | Platform: Linux-6.1.0-rpi-arm64
+2026-06-30 15:00:00 [INFO] Target server: ws://192.168.1.42:8765
+2026-06-30 15:00:00 [INFO] Sending HELLO (device_id=raspberrypi)
+2026-06-30 15:00:00 [INFO] Handshake complete! session_id=sess_abc123, audio_config={'sample_rate': 24000, 'format': 'pcm16', 'channels': 1}
+2026-06-30 15:00:00 [INFO] Entering main loop. Sending status every 10s.
+```
+
+## Tests (no hardware required)
+
+Run on any machine:
 
 ```bash
-python src/realtime_connect.py
+python test_client.py
+python test_audio.py
 ```
 
-**4. Audio hardware test:**
+## End-to-end test
+
+1. Start the laptop app with the WebSocket server: `python -m voice_assistant --web`
+2. On the Pi, connect the client: `python pi5_client.py ws://LAPTOP_IP:8765`
+3. From the dashboard, click **Start Session** (sends `START_AUDIO_STREAM`)
+4. Speak into the Pi microphone — you should hear your voice on the Pi speaker
+   after round-trip through the laptop
+5. Click **Stop Session** to stop capture
+
+Quick local ALSA sanity check on the Pi (no network):
 
 ```bash
-python src/check_audio.py
+arecord -D plughw:2,0 -f S16_LE -r 24000 -c 1 -t raw -d 2 /tmp/test.raw
+aplay -D plughw:3,0 -f S16_LE -r 24000 -c 1 -t raw /tmp/test.raw
 ```
 
-Lists devices; with hardware connected, records 3 seconds and plays them back.
+## Troubleshooting
 
-**5. Live voice assistant:**
+### "Connection refused"
+The `voice-assistant-app` is not running on the laptop, or is not listening on
+port 8765. Start it first: `python -m voice_assistant` on the laptop.
 
-```bash
-python src/voice_assistant.py
-```
+### "No route to host" / "Network is unreachable"
+The Pi and laptop are not on the same network. Check both are on the same
+Wi-Fi SSID, and try `ping LAPTOP_IP` from the Pi.
 
-On start you’ll be asked to stay quiet, then say a few words for calibration. After `[Ready]`, speak normally. Wait for the full reply and `[Ready]` again before your next turn. Press `Ctrl+C` to quit.
+### Timeout waiting for HELLO_ACK
+The app is running but may not have a WebSocket server active (e.g. running in
+mock mode without the WebSocket transport). Start it without `--mock`.
 
-Optional env vars (see `.env.example`):
+### "websockets" import error
+`pip install websockets>=15.0`. If using a virtual environment, make sure it's
+activated.
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `REALTIME_MODEL` | `gpt-realtime-mini` | Realtime model |
-| `REALTIME_VOICE` | `alloy` | Assistant voice |
-| `AUDIO_INPUT_DEVICE` | auto | ALSA mic (e.g. `plughw:2,0`) |
-| `AUDIO_OUTPUT_DEVICE` | auto | ALSA speaker (e.g. `plughw:3,0`) |
-| `VOICE_DEBUG` | off | Threshold and event debug lines |
-| `CALIBRATION_QUIET_SEC` | `1.0` | Quiet phase length |
-| `CALIBRATION_SPEAK_SEC` | `3.5` | Speak phase max length |
+### Ctrl+C doesn't stop the script
+The script handles `KeyboardInterrupt`. If it doesn't respond immediately, it
+may be in a backoff sleep — wait for the current sleep to finish or press
+Ctrl+C again.
 
-## Quick start with hardware
+## Relationship to the Pi Zero 2W client
 
-1. Plug in USB mic and USB speaker.
-2. `python src/check_audio.py` — confirm record/playback works.
-3. Adjust volume if needed (see [speaker_mic_set_up.md](speaker_mic_set_up.md)).
-4. `python src/voice_assistant.py` — talk to the assistant.
+Protocol-identical to `voice-assistant-piZero2W`'s `zero2w_client.py`. The
+message schema (`HELLO`, `HELLO_ACK`, `DEVICE_STATUS`, `START/STOP_AUDIO_STREAM`,
+`AUDIO_FRAME`, `PLAY_AUDIO`, calibration, `PLAYBACK_COMPLETE`) is unchanged, so
+the same app handlers work for both. Only the hardware layer (USB sound cards
+vs. GPIO I2S) and `device_type` differ.
