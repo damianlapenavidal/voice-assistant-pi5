@@ -41,6 +41,7 @@ try:
         ConnectionClosed,
         ConnectionClosedError,
         InvalidURI,
+        WebSocketException,
     )
 except ImportError:
     print("ERROR: 'websockets' library is required.")
@@ -256,21 +257,8 @@ class Pi5Client:
                     attempt = 0  # Reset on successful connection
                     await self._session(ws)
 
-            except (OSError, ConnectionRefusedError) as e:
-                attempt += 1
-                if attempt >= MAX_RECONNECT_ATTEMPTS:
-                    logger.error(
-                        "Failed to connect after %d attempts. Giving up.",
-                        MAX_RECONNECT_ATTEMPTS,
-                    )
-                    break
-                backoff = INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                logger.warning(
-                    "Connection failed (%s). Retrying in %.1fs...", e, backoff,
-                )
-                await asyncio.sleep(backoff)
-
             except ConnectionClosed as e:
+                # Dropped after a successful handshake -- reconnect.
                 attempt += 1
                 if attempt >= MAX_RECONNECT_ATTEMPTS:
                     logger.error(
@@ -287,6 +275,23 @@ class Pi5Client:
             except InvalidURI as e:
                 logger.error("Invalid WebSocket URL: %s", e)
                 break
+
+            except (OSError, ConnectionRefusedError, WebSocketException) as e:
+                # Includes the SSH-tunnel case: TCP to 127.0.0.1:8765 succeeds
+                # (sshd accepts) but the Mac app is not listening yet, so the
+                # handshake fails with InvalidMessage instead of ECONNREFUSED.
+                attempt += 1
+                if attempt >= MAX_RECONNECT_ATTEMPTS:
+                    logger.error(
+                        "Failed to connect after %d attempts. Giving up.",
+                        MAX_RECONNECT_ATTEMPTS,
+                    )
+                    break
+                backoff = INITIAL_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.warning(
+                    "Connection failed (%s). Retrying in %.1fs...", e, backoff,
+                )
+                await asyncio.sleep(backoff)
 
         self._running = False
         logger.info("Client stopped.")
