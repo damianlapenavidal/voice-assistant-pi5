@@ -8,6 +8,7 @@ Run with: python test_audio.py
 import asyncio
 import base64
 import json
+import struct
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,7 +16,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from audio_capture import CHUNK_BYTES, AudioCapture
-from audio_playback import BYTE_RATE, PlaybackManager
+from audio_capture import _soft_limit as _capture_soft_limit
+from audio_playback import BYTE_RATE, PlaybackManager, _apply_gain
 from pi5_client import make_audio_frame, parse_message
 
 
@@ -85,6 +87,34 @@ async def _test_audio_capture_read_chunk():
     assert capture._build_command()[-2:] == ["-D", "plughw:2,0"]
 
     print("  PASS: test_audio_capture_read_chunk")
+
+
+async def _test_audio_capture_read_chunk_applies_input_gain():
+    """read_chunk() scales mono samples by INPUT_GAIN, soft-limited at the ceiling."""
+    n = CHUNK_BYTES // 2
+    pcm = struct.pack(f"<{n}h", *([10000] * n))
+
+    fake_stdout = asyncio.StreamReader()
+    fake_stdout.feed_data(pcm)
+    fake_stdout.feed_eof()
+
+    fake_process = MagicMock()
+    fake_process.returncode = None
+    fake_process.stdout = fake_stdout
+    fake_process.stderr = asyncio.StreamReader()
+
+    capture = AudioCapture(input_gain=4.0)  # 10000 * 4 = 40000, well past the ceiling
+    capture._process = fake_process
+    capture._running = True
+
+    chunk = await capture.read_chunk()
+    values = set(struct.unpack(f"<{n}h", chunk))
+    assert len(values) == 1
+    (result,) = values
+    knee = int(0.85 * 32767)
+    assert knee < result <= 32767  # soft-limited, not hard-clipped flat
+
+    print("  PASS: test_audio_capture_read_chunk_applies_input_gain")
 
 
 async def _test_audio_capture_start_uses_arecord():
@@ -363,6 +393,140 @@ async def _test_drain_buffered_audio_noop_when_idle():
     print("  PASS: test_drain_buffered_audio_noop_when_idle")
 
 
+def _test_apply_gain_scales_and_clips():
+    """_apply_gain() scales PCM16 samples; overshoots soft-limit, never exceed ceiling."""
+    knee = int(0.85 * 32767)  # _LIMITER_KNEE_FRACTION
+    pcm = struct.pack("<3h", 1000, -1000, 20000)
+
+    unity = _apply_gain(pcm, 1.0)
+    assert unity == pcm  # no-op, same bytes (not just same values)
+
+    scaled = _apply_gain(pcm, 2.0)
+    values = struct.unpack("<3h", scaled)
+    assert values[0] == 2000  # well under the knee -> untouched linear scaling
+    assert values[1] == -2000
+    assert knee < values[2] < 32767
+
+    extreme = _apply_gain(struct.pack("<1h", 20000), 20.0)
+    assert struct.unpack("<1h", extreme)[0] <= 32767
+
+    print("  PASS: test_apply_gain_scales_and_clips")
+
+
+def _test_soft_limit_shape():
+    """_soft_limit(): passthrough below the knee, smooth + bounded above it."""
+    knee = int(0.85 * 32767)
+
+    assert _capture_soft_limit(1000.0) == 1000
+    assert _capture_soft_limit(-1000.0) == -1000
+    assert _capture_soft_limit(float(knee)) == knee
+
+    just_over = _capture_soft_limit(knee + 500.0)
+    assert knee < just_over < knee + 500
+
+    prev = 0
+    for magnitude in (0, 5000, 20000, 32767, 50000, 100000):
+        result = _capture_soft_limit(float(magnitude))
+        assert result >= prev
+        prev = result
+
+    assert _capture_soft_limit(1_000_000.0) <= 32767
+
+    print("  PASS: test_soft_limit_shape")
+
+
+def _test_openai_style_loud_source_does_not_hard_clip():
+    """Already near-full-scale TTS + leftover gain must soft-limit, not hard-clip."""
+    loud_source = struct.pack("<4h", 30000, -30000, 31000, -31000)
+    over_driven = _apply_gain(loud_source, 2.5)
+    values = struct.unpack("<4h", over_driven)
+
+    assert all(-32768 <= v <= 32767 for v in values)
+    assert len(set(values)) > 1, "all samples flattened -- hard clipping regression"
+
+    print("  PASS: test_openai_style_loud_source_does_not_hard_clip")
+
+
+async def _test_playback_manager_applies_playback_gain():
+    """play_pcm16_chunk() scales bytes by playback_gain before writing to aplay."""
+    fake_stdin = MagicMock()
+    fake_stdin.write = MagicMock()
+    fake_stdin.drain = AsyncMock()
+    fake_stdin.is_closing = MagicMock(return_value=False)
+    fake_stdin.close = MagicMock()
+    fake_stdin.wait_closed = AsyncMock()
+
+    mock_process = MagicMock()
+    mock_process.returncode = None
+    mock_process.stdin = fake_stdin
+    mock_process.stderr = asyncio.StreamReader()
+
+    with patch(
+        "audio_playback.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ):
+        playback = PlaybackManager(playback_gain=0.5)
+        pcm = struct.pack("<2h", 1000, -1000)
+        await playback.play_pcm16_chunk(pcm)
+
+        written = fake_stdin.write.call_args[0][0]
+        assert struct.unpack("<2h", written) == (500, -500)
+
+    print("  PASS: test_playback_manager_applies_playback_gain")
+
+
+class _FakeWebSocket:
+    """Minimal async-iterable fake WS: yields preset messages, then closes."""
+
+    def __init__(self, messages: list[str]):
+        self._messages = messages
+        self.sent: list[str] = []
+
+    def __aiter__(self):
+        return self._gen()
+
+    async def _gen(self):
+        for m in self._messages:
+            yield m
+
+    async def send(self, msg: str) -> None:
+        self.sent.append(msg)
+
+
+async def _test_set_volume_updates_playback_gain():
+    """SET_VOLUME (0-100) maps onto [0, MAX_PLAYBACK_GAIN]."""
+    from pi5_client import MAX_PLAYBACK_GAIN, Pi5Client
+
+    client = Pi5Client("ws://test")
+
+    ws = _FakeWebSocket([json.dumps({"type": "SET_VOLUME", "payload": {"volume": 70}})])
+    await client._receive_loop(ws)
+    assert abs(client._playback.playback_gain - 0.7 * MAX_PLAYBACK_GAIN) < 1e-9
+
+    ws = _FakeWebSocket([json.dumps({"type": "SET_VOLUME", "payload": {"volume": 150}})])
+    await client._receive_loop(ws)
+    assert abs(client._playback.playback_gain - MAX_PLAYBACK_GAIN) < 1e-9
+
+    print("  PASS: test_set_volume_updates_playback_gain")
+
+
+async def _test_set_mic_gain_updates_input_gain():
+    """SET_MIC_GAIN (0-100) maps onto [0, MAX_INPUT_GAIN], applied live to capture."""
+    from pi5_client import MAX_INPUT_GAIN, Pi5Client
+
+    client = Pi5Client("ws://test")
+
+    ws = _FakeWebSocket([json.dumps({"type": "SET_MIC_GAIN", "payload": {"gain": 40}})])
+    await client._receive_loop(ws)
+    assert abs(client._audio_capture.input_gain - 0.4 * MAX_INPUT_GAIN) < 1e-9
+
+    ws = _FakeWebSocket([json.dumps({"type": "SET_MIC_GAIN", "payload": {"gain": 150}})])
+    await client._receive_loop(ws)
+    assert abs(client._audio_capture.input_gain - MAX_INPUT_GAIN) < 1e-9
+
+    print("  PASS: test_set_mic_gain_updates_input_gain")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -372,15 +536,22 @@ def main():
         test_audio_frame_message_structure,
         test_audio_frame_base64_roundtrip,
         test_audio_frame_chunk_size,
+        _test_apply_gain_scales_and_clips,
+        _test_soft_limit_shape,
+        _test_openai_style_loud_source_does_not_hard_clip,
     ]
     async_tests = [
         _test_audio_capture_read_chunk,
+        _test_audio_capture_read_chunk_applies_input_gain,
         _test_audio_capture_start_uses_arecord,
         _test_playback_manager_pipes_to_aplay,
+        _test_playback_manager_applies_playback_gain,
         _test_streaming_chunks_then_finalize,
         _test_single_blob_still_works,
         _test_finalize_returns_correct_duration,
         _test_streaming_finalize_with_empty_final_chunk,
+        _test_set_volume_updates_playback_gain,
+        _test_set_mic_gain_updates_input_gain,
         _test_skip_calibration_streams_immediately,
         _test_fresh_start_runs_calibration,
         _test_drain_buffered_audio_discards_backlog,

@@ -48,12 +48,19 @@ Optional environment variables select ALSA devices:
 |----------|---------|-------------|
 | `AUDIO_INPUT_DEVICE` | `plughw:2,0` | Microphone device for `arecord` |
 | `AUDIO_OUTPUT_DEVICE` | `plughw:3,0` | Speaker device for `aplay` |
+| `INPUT_GAIN` | `1.0` | Mic software make-up gain (soft-limited) |
+| `PLAYBACK_GAIN` | `1.0` | Speaker gain at connect (before dashboard slider) |
 
 Mic and speaker are often **different ALSA cards** when using separate USB
 devices. On this Pi 5, the mic is card 2 and the USB speaker is card 3 — do not
 use `plughw:0,0` unless that is your actual speaker (`aplay -l`). See
 [speaker_mic_set_up.md](speaker_mic_set_up.md) for card numbers and volume
 commands.
+
+`INPUT_GAIN` / `PLAYBACK_GAIN` are steady multipliers applied per chunk (not
+AGC). Peaks that would clip are soft-limited. After connect, the laptop
+dashboard's **Speaker Volume** / **Mic Gain** sliders update them live via
+`SET_VOLUME` / `SET_MIC_GAIN` (0–100% maps to 0–3.0x playback and 0–50x mic).
 
 Copy `.env.example` to `.env`; `pi5_client.py` loads it automatically on
 startup.
