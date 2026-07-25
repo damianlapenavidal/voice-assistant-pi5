@@ -73,9 +73,14 @@ PROMPT_SETTLE_SEC = 0.6
 # the slider into the ceiling. (The old range boosted above unity for a quiet
 # raw-mic loopback source that this thin client no longer has.)
 MAX_PLAYBACK_GAIN = 1.0
-# SET_MIC_GAIN's 0-100 range maps onto [0, MAX_INPUT_GAIN]. Leave headroom
-# above the .env default so the dashboard slider can tune in both directions.
-MAX_INPUT_GAIN = 50.0
+# SET_MIC_GAIN's 0-100 range maps onto [0, MAX_INPUT_GAIN]. Measured on the
+# Pi 5 capture chain: past ~15x, normal speech peaks drive the soft-knee
+# limiter hard and clip very easily. The old 50.0 ceiling put that threshold
+# at 30% of the slider, so the top ~70% was all limiter mush and the usable
+# range was squeezed into the bottom third -- the same flaw MAX_PLAYBACK_GAIN
+# above was capped to fix. Cap at the clipping threshold instead, so the full
+# slider is usable and 100% is the loudest setting that still holds together.
+MAX_INPUT_GAIN = 15.0
 
 # ---------------------------------------------------------------------------
 # Logging
