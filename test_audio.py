@@ -5,11 +5,13 @@ Tests for Pi 5 audio capture/playback and AUDIO_FRAME message format.
 Run with: python test_audio.py
 """
 
+import array
 import asyncio
 import base64
 import json
 import struct
 import sys
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -209,7 +211,10 @@ async def _test_streaming_chunks_then_finalize():
 
         assert playback.is_streaming
         assert mock_exec.await_count == 1
-        assert fake_stdin.write.call_count == num_chunks
+        # Each chunk is written as paced sub-chunks (so gain stays current),
+        # so assert on the bytes that reached aplay, not the write count.
+        written = b"".join(c.args[0] for c in fake_stdin.write.call_args_list)
+        assert written == chunk * num_chunks
 
         duration = await playback.finalize_streaming()
 
@@ -565,6 +570,81 @@ async def _test_set_volume_not_blocked_by_active_playback():
     print("  PASS: test_set_volume_not_blocked_by_active_playback")
 
 
+async def _test_volume_change_applies_mid_response():
+    """A volume change part-way through a response affects the rest of it.
+
+    Regression: gain was baked into the whole buffer before any of it was
+    written to aplay, so a SET_VOLUME arriving mid-response could not change
+    audio that had already been converted -- it was only audible on the next
+    response. Gain is now applied per paced sub-chunk at write time.
+    """
+    from audio_playback import WRITE_CHUNK_BYTES
+
+    mock_process, fake_stdin = _make_mock_streaming_process()
+    playback = PlaybackManager(playback_gain=1.0)
+
+    # Halve the volume right after the first sub-chunk reaches aplay, standing
+    # in for a SET_VOLUME handled by the receive loop mid-playback.
+    def _on_write(data):
+        if fake_stdin.write.call_count == 1:
+            playback.playback_gain = 0.5
+
+    fake_stdin.write.side_effect = _on_write
+
+    sample = 1000  # constant tone: gain is readable straight off the samples
+    pcm = array.array("h", [sample] * ((WRITE_CHUNK_BYTES * 3) // 2)).tobytes()
+
+    with patch(
+        "audio_playback.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ):
+        await playback.play_pcm16_chunk(pcm, is_final=False)
+
+    writes = [c.args[0] for c in fake_stdin.write.call_args_list]
+    assert len(writes) >= 3, f"expected sub-chunked writes, got {len(writes)}"
+
+    first = array.array("h")
+    first.frombytes(writes[0])
+    last = array.array("h")
+    last.frombytes(writes[-1])
+
+    assert first[0] == sample, "audio written before the change kept its volume"
+    assert last[0] == sample // 2, "audio written after the change must be quieter"
+
+    print("  PASS: test_volume_change_applies_mid_response")
+
+
+async def _test_write_pacing_limits_audio_written_ahead():
+    """The writer does not run far ahead of real-time playback.
+
+    This is what bounds how stale the baked-in gain can be: without it the
+    whole response is written (and its volume locked in) almost instantly.
+    """
+    from audio_playback import MAX_WRITE_LEAD_SEC
+
+    mock_process, fake_stdin = _make_mock_streaming_process()
+    playback = PlaybackManager()
+
+    # 1 second of audio, delivered all at once.
+    pcm = b"\x00\x01" * (BYTE_RATE // 2)
+
+    with patch(
+        "audio_playback.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=mock_process),
+    ):
+        start = time.monotonic()
+        await playback.play_pcm16_chunk(pcm, is_final=False)
+        elapsed = time.monotonic() - start
+
+    # Writing 1s of audio must take about 1s minus the allowed lead, rather
+    # than completing instantly.
+    assert elapsed > 1.0 - MAX_WRITE_LEAD_SEC - 0.1, (
+        f"writer ran ahead of playback: 1s of audio written in {elapsed:.3f}s"
+    )
+
+    print("  PASS: test_write_pacing_limits_audio_written_ahead")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -590,6 +670,8 @@ def main():
         _test_streaming_finalize_with_empty_final_chunk,
         _test_set_volume_updates_playback_gain,
         _test_set_volume_not_blocked_by_active_playback,
+        _test_volume_change_applies_mid_response,
+        _test_write_pacing_limits_audio_written_ahead,
         _test_set_mic_gain_updates_input_gain,
         _test_skip_calibration_streams_immediately,
         _test_fresh_start_runs_calibration,

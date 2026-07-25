@@ -7,6 +7,7 @@ import asyncio
 import logging
 import math
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,17 @@ BYTES_PER_SAMPLE = 2
 BYTE_RATE = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE
 FORMAT = "S16_LE"
 BUFFER_US = 300000
-WRITE_CHUNK_BYTES = 4800  # 100 ms sub-chunks for stdin writes
+WRITE_CHUNK_BYTES = 960  # 20 ms sub-chunks for stdin writes
+
+# Gain is baked into samples at write time, so a chunk is "locked in" the
+# moment it is written. Audio arrives far faster than real time, so writing
+# eagerly would bake the whole response at its starting volume and leave a
+# mid-response SET_VOLUME inaudible until the next response. Instead the
+# writer stays at most this far ahead of the real-time playback position,
+# which bounds how stale the applied gain can be. It also bounds how much
+# audio sits pre-baked in the pipe; the remaining latency floor is aplay's
+# own BUFFER_US, which ALSA will not let us rewrite once queued.
+MAX_WRITE_LEAD_SEC = 0.15
 
 DEFAULT_PLAYBACK_GAIN = 1.0
 _INT16_MAX = 32767
@@ -80,6 +91,8 @@ class PlaybackManager:
         self._playback_gain = playback_gain
         self._process: asyncio.subprocess.Process | None = None
         self._streamed_bytes = 0
+        self._pacing_start: float | None = None
+        self._paced_bytes = 0
 
     @property
     def device(self) -> str | None:
@@ -115,11 +128,48 @@ class PlaybackManager:
             cmd.extend(["-D", self._device])
         return cmd
 
+    def _reset_pacing(self) -> None:
+        """Forget the previous stream's playback clock (new aplay, new timeline)."""
+        self._pacing_start = None
+        self._paced_bytes = 0
+
+    async def _await_write_slot(self, nbytes: int) -> None:
+        """Block until writing `nbytes` keeps us within MAX_WRITE_LEAD_SEC.
+
+        Models the playback position as wall-clock elapsed since the first
+        write. When audio arrives slower than real time -- the normal TTS
+        streaming case -- the lead is negative and this never sleeps, so
+        pacing costs nothing until we are actually running ahead.
+        """
+        now = time.monotonic()
+        if self._pacing_start is None:
+            self._pacing_start = now
+
+        lead = self._paced_bytes / BYTE_RATE - (now - self._pacing_start)
+        if lead > MAX_WRITE_LEAD_SEC:
+            await asyncio.sleep(lead - MAX_WRITE_LEAD_SEC)
+
+        self._paced_bytes += nbytes
+
+    async def _write_paced(self, stdin, pcm_bytes: bytes) -> None:
+        """Write PCM to aplay in sub-chunks, applying the gain current at that moment.
+
+        Splitting the write is what lets a SET_VOLUME land mid-response:
+        each sub-chunk reads `self._playback_gain` fresh, and pacing keeps
+        un-baked audio from piling up in the pipe ahead of it.
+        """
+        for offset in range(0, len(pcm_bytes), WRITE_CHUNK_BYTES):
+            part = pcm_bytes[offset:offset + WRITE_CHUNK_BYTES]
+            await self._await_write_slot(len(part))
+            stdin.write(_apply_gain(part, self._playback_gain))
+            await stdin.drain()
+
     async def _ensure_process(self) -> None:
         if self._process is not None and self._process.returncode is None:
             return
 
         self._streamed_bytes = 0
+        self._reset_pacing()
         cmd = self._build_command()
         logger.info("Starting audio playback: %s", " ".join(cmd))
 
@@ -152,7 +202,9 @@ class PlaybackManager:
         if not pcm_bytes and not is_final:
             return 0.0
 
-        pcm_bytes = _apply_gain(pcm_bytes, self._playback_gain)
+        # Gain is deliberately NOT applied here: it is applied per sub-chunk at
+        # write time (see _write_paced) so a volume change mid-response affects
+        # the audio that has not been written yet.
         duration_sec = len(pcm_bytes) / BYTE_RATE
 
         if is_final:
@@ -171,8 +223,7 @@ class PlaybackManager:
             if self._process is None or self._process.stdin is None:
                 raise PlaybackError("aplay process is not running")
 
-        self._process.stdin.write(pcm_bytes)
-        await self._process.stdin.drain()
+        await self._write_paced(self._process.stdin, pcm_bytes)
         self._streamed_bytes += len(pcm_bytes)
         return duration_sec
 
@@ -188,6 +239,7 @@ class PlaybackManager:
         duration_sec = self._streamed_bytes / BYTE_RATE
         self._process = None
         self._streamed_bytes = 0
+        self._reset_pacing()
 
         stderr_data = b""
         try:
@@ -212,8 +264,14 @@ class PlaybackManager:
         return duration_sec
 
     async def _play_final(self, pcm_bytes: bytes) -> None:
-        """Play one complete response: feed sub-chunks, close stdin, wait for drain."""
+        """Play one complete response: feed sub-chunks, close stdin, wait for drain.
+
+        The whole response is in hand here, but it is still written paced and
+        gain-applied per sub-chunk rather than converted up front -- otherwise
+        the entire response would be locked to the volume it started at.
+        """
         await self.stop()
+        self._reset_pacing()
 
         cmd = self._build_command(quiet=True)
         logger.info("Starting final playback (%d bytes): %s", len(pcm_bytes), " ".join(cmd))
@@ -231,10 +289,7 @@ class PlaybackManager:
         stderr_data = b""
         try:
             if pcm_bytes and process.stdin is not None:
-                for offset in range(0, len(pcm_bytes), WRITE_CHUNK_BYTES):
-                    part = pcm_bytes[offset:offset + WRITE_CHUNK_BYTES]
-                    process.stdin.write(part)
-                    await process.stdin.drain()
+                await self._write_paced(process.stdin, pcm_bytes)
 
             if process.stdin is not None and not process.stdin.is_closing():
                 process.stdin.close()
@@ -259,6 +314,7 @@ class PlaybackManager:
         process = self._process
         self._process = None
         self._streamed_bytes = 0
+        self._reset_pacing()
 
         if process is None:
             return

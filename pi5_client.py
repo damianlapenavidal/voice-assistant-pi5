@@ -660,10 +660,11 @@ class Pi5Client:
     async def _playback_worker_loop(self) -> None:
         """Play queued PLAY_AUDIO chunks in order, off the receive loop.
 
-        Gain (SET_VOLUME) is applied per chunk at write time inside
-        PlaybackManager, so a volume change updates every chunk still queued
-        here -- audible within aplay's own buffer rather than only on the next
-        response.
+        PlaybackManager writes paced sub-chunks and applies the gain current
+        at each write, so a SET_VOLUME lands on audio not yet written --
+        including audio still queued here. That pacing means this loop now
+        blocks for roughly the real duration of the response, which is
+        exactly why it must not run on the receive loop.
         """
         assert self._playback_queue is not None
         while True:
