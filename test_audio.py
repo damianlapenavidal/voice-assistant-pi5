@@ -486,6 +486,7 @@ class _FakeWebSocket:
     def __init__(self, messages: list[str]):
         self._messages = messages
         self.sent: list[str] = []
+        self._recv_index = 0
 
     def __aiter__(self):
         return self._gen()
@@ -493,6 +494,15 @@ class _FakeWebSocket:
     async def _gen(self):
         for m in self._messages:
             yield m
+
+    async def recv(self) -> str:
+        """Pop the next preset message, for code that awaits recv() directly
+        (the handshake) rather than iterating."""
+        if self._recv_index >= len(self._messages):
+            raise AssertionError("recv() called with no messages left")
+        msg = self._messages[self._recv_index]
+        self._recv_index += 1
+        return msg
 
     async def send(self, msg: str) -> None:
         self.sent.append(msg)
@@ -645,6 +655,485 @@ async def _test_write_pacing_limits_audio_written_ahead():
     print("  PASS: test_write_pacing_limits_audio_written_ahead")
 
 
+def _one_chunk_then_block(chunk: bytes):
+    """A read_chunk stand-in that yields one chunk, then blocks forever.
+
+    A real capture blocks until arecord has audio, which paces the stream
+    loop at real time. A mock that returns instantly instead spins the loop
+    as fast as the event loop allows -- millions of iterations and unbounded
+    memory in the time it takes to cancel it. Blocking after the first chunk
+    keeps the send count deterministic and the test honest about pacing.
+    """
+    async def read_chunk():
+        if not sent_one:
+            sent_one.append(True)
+            return chunk
+        await asyncio.Event().wait()
+
+    sent_one: list = []
+    return read_chunk
+
+
+def _chunks_then_block(chunks: list):
+    """Generalization of _one_chunk_then_block: yields each chunk in order,
+    then blocks forever, for tests feeding a silence-then-speech sequence."""
+    index = {"i": 0}
+
+    async def read_chunk():
+        i = index["i"]
+        if i < len(chunks):
+            index["i"] += 1
+            return chunks[i]
+        await asyncio.Event().wait()
+
+    return read_chunk
+
+
+_QUIET_CHUNK = b"\x00\x00" * (CHUNK_BYTES // 2)  # RMS 0 -- well under any calibrated threshold
+_LOUD_CHUNK = struct.pack("<h", 20000) * (CHUNK_BYTES // 2)  # RMS 20000 -- well over
+
+
+# ---------------------------------------------------------------------------
+# Phase 5a: event-driven DEVICE_STATUS
+# ---------------------------------------------------------------------------
+
+
+async def _test_status_loop_silent_while_idle():
+    """No DEVICE_STATUS at all while idle -- Phase 5a drops the every-10s
+    heartbeat for its own sake, since idle is most of the device's life."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    ws = _FakeWebSocket([])
+
+    task = asyncio.create_task(client._status_loop(ws))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert ws.sent == []
+    print("  PASS: test_status_loop_silent_while_idle")
+
+
+async def _test_status_loop_sends_immediately_on_recording_transitions():
+    """A recording-state change wakes the loop immediately, so the app learns
+    is_recording changed within one tick rather than up to
+    STATUS_INTERVAL_SECONDS late."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    ws = _FakeWebSocket([])
+
+    with patch("pi5_client.STATUS_INTERVAL_SECONDS", 999):
+        task = asyncio.create_task(client._status_loop(ws))
+        await asyncio.sleep(0.01)
+        assert ws.sent == []  # still idle, no timer-driven send
+
+        client.is_recording = True
+        client._status_event.set()
+        await asyncio.sleep(0.01)
+        assert len(ws.sent) == 1
+        assert json.loads(ws.sent[0])["payload"]["is_recording"] is True
+
+        client.is_recording = False
+        client._status_event.set()
+        await asyncio.sleep(0.01)
+        assert len(ws.sent) == 2
+        assert json.loads(ws.sent[1])["payload"]["is_recording"] is False
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    print("  PASS: test_status_loop_sends_immediately_on_recording_transitions")
+
+
+async def _test_status_loop_sends_periodically_while_recording():
+    """cpu_temp only matters mid-session, so recording keeps the old
+    STATUS_INTERVAL_SECONDS cadence even with no new state-change events."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    ws = _FakeWebSocket([])
+    client.is_recording = True
+
+    with patch("pi5_client.STATUS_INTERVAL_SECONDS", 0.02):
+        task = asyncio.create_task(client._status_loop(ws))
+        await asyncio.sleep(0.07)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    # ~0.07s at a 0.02s interval -> at least 3 sends, none event-triggered.
+    assert len(ws.sent) >= 3
+    assert all(json.loads(m)["payload"]["is_recording"] is True for m in ws.sent)
+    print("  PASS: test_status_loop_sends_periodically_while_recording")
+
+
+async def _test_start_and_stop_audio_trigger_status_event():
+    """_start_audio/_stop_audio actually set _status_event -- the wiring
+    _status_loop depends on to notice a recording transition at all."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    ws = MagicMock()
+    ws.send = AsyncMock()
+    client._audio_capture.start = AsyncMock()
+
+    assert not client._status_event.is_set()
+    await client._start_audio(ws, {"skip_calibration": True})
+    assert client._status_event.is_set()
+
+    client._status_event.clear()
+    await client._stop_audio()
+    assert client._status_event.is_set()
+
+    print("  PASS: test_start_and_stop_audio_trigger_status_event")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: binary audio framing
+# ---------------------------------------------------------------------------
+
+
+async def _test_handshake_negotiates_binary_audio():
+    """HELLO_ACK carrying negotiated_capabilities: [binary_audio] flips the
+    client's send path to binary for subsequent AUDIO_FRAMEs."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    ws = _FakeWebSocket([json.dumps({
+        "type": "HELLO_ACK",
+        "payload": {
+            "session_id": "s",
+            "audio_config": {"sample_rate": 24000},
+            "negotiated_capabilities": ["binary_audio"],
+        },
+    })])
+
+    await client._handshake(ws)
+
+    assert client._binary_audio_enabled is True
+    print("  PASS: test_handshake_negotiates_binary_audio")
+
+
+async def _test_handshake_without_negotiation_stays_json():
+    """No negotiated_capabilities (an app still on the pre-Phase-4 build)
+    leaves the client on JSON framing."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    ws = _FakeWebSocket([json.dumps({
+        "type": "HELLO_ACK",
+        "payload": {"session_id": "s", "audio_config": {"sample_rate": 24000}},
+    })])
+
+    await client._handshake(ws)
+
+    assert client._binary_audio_enabled is False
+    print("  PASS: test_handshake_without_negotiation_stays_json")
+
+
+async def _test_audio_stream_loop_sends_binary_frame_when_negotiated():
+    """Once binary_audio is negotiated, AUDIO_FRAME goes out as a packed
+    header + raw PCM instead of base64-in-JSON."""
+    from pi5_client import AUDIO_FRAME_TAG, HEADER_VERSION, Pi5Client
+
+    client = Pi5Client("ws://test")
+    client._binary_audio_enabled = True
+    client.is_recording = True
+    client._stream_to_laptop = True
+
+    chunk = b"\x11\x22\x33\x44" * 100
+    client._audio_capture.read_chunk = _one_chunk_then_block(chunk)
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    task = asyncio.create_task(client._audio_stream_loop(ws))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(sent) == 1
+    frame = sent[0]
+    assert isinstance(frame, bytes)
+    header = struct.Struct(">BBIQI")
+    tag, version, seq, _capture_ms, reserved = header.unpack_from(frame, 0)
+    assert tag == AUDIO_FRAME_TAG
+    assert version == HEADER_VERSION
+    assert seq == 1
+    assert reserved == 0
+    assert frame[header.size:] == chunk
+
+    print("  PASS: test_audio_stream_loop_sends_binary_frame_when_negotiated")
+
+
+async def _test_audio_stream_loop_sends_json_frame_when_not_negotiated():
+    """Default (not negotiated) behavior is unchanged: base64-in-JSON."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    client.is_recording = True
+    client._stream_to_laptop = True
+
+    chunk = b"\xAA\xBB"
+    client._audio_capture.read_chunk = _one_chunk_then_block(chunk)
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    task = asyncio.create_task(client._audio_stream_loop(ws))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(sent) == 1
+    assert isinstance(sent[0], str)
+    msg = json.loads(sent[0])
+    assert msg["type"] == "AUDIO_FRAME"
+    assert base64.b64decode(msg["payload"]["audio"]) == chunk
+
+    print("  PASS: test_audio_stream_loop_sends_json_frame_when_not_negotiated")
+
+
+async def _test_receive_loop_queues_binary_play_audio():
+    """A binary PLAY_AUDIO frame through _receive_loop decodes correctly and
+    reaches the playback queue, same shape as the JSON path.
+
+    Pre-creates the queue and stubs out _ensure_playback_worker so nothing
+    concurrently drains it -- this test is about the decode+dispatch, not the
+    worker (covered elsewhere).
+    """
+    from pi5_client import HEADER_VERSION, PLAY_AUDIO_TAG, Pi5Client
+
+    client = Pi5Client("ws://test")
+    client._playback_queue = asyncio.Queue()
+    client._ensure_playback_worker = lambda: None
+
+    pcm = b"\x01\x02\x03\x04"
+    header = struct.pack(">BBIBII", PLAY_AUDIO_TAG, HEADER_VERSION, 5, 0x01, 100, 0)
+    ws = _FakeWebSocket([header + pcm])
+
+    await client._receive_loop(ws)
+
+    _, payload = client._playback_queue.get_nowait()
+    assert payload["audio"] == pcm
+    assert payload["sequence_number"] == 5
+    assert payload["is_final"] is True
+    assert payload["duration_ms"] == 100
+
+    print("  PASS: test_receive_loop_queues_binary_play_audio")
+
+
+async def _test_receive_loop_drops_malformed_binary_frame():
+    """A malformed binary frame is dropped silently -- no crash, and it never
+    even reaches the playback worker."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    called = {"value": False}
+    client._ensure_playback_worker = lambda: called.__setitem__("value", True)
+
+    ws = _FakeWebSocket([b"\x02"])  # too short to be a valid header
+    await client._receive_loop(ws)  # must not raise
+
+    assert called["value"] is False
+    print("  PASS: test_receive_loop_drops_malformed_binary_frame")
+
+
+async def _test_stop_playback_worker_survives_cancel_mid_final_chunk():
+    """Regression: STOP_AUDIO_STREAM arriving right after a final PLAY_AUDIO
+    used to crash the client. _stop_playback_worker() nils
+    self._playback_queue, then cancels the worker; if the worker was blocked
+    inside _handle_play_audio (e.g. finalize_streaming()'s subprocess wait),
+    the CancelledError landed in a `finally: self._playback_queue.task_done()`
+    that read None instead of the queue, raising AttributeError and crashing
+    the whole client. Reproduced live on the Zero 2 W 2026-07-29; the Pi 5
+    carried the identical bug in its own copy of the worker."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    client._ensure_playback_worker()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_finalize():
+        started.set()
+        await release.wait()
+        return 1.0
+
+    # is_streaming is read-only, derived from a live aplay subprocess; fake
+    # one so the property reads True without spawning a real process.
+    client._playback._process = MagicMock(returncode=None)
+    client._playback.finalize_streaming = slow_finalize
+
+    ws = MagicMock()
+    ws.send = AsyncMock()
+    client._playback_queue.put_nowait((ws, {
+        "audio": b"", "sequence_number": 1, "is_final": True,
+    }))
+
+    await asyncio.wait_for(started.wait(), timeout=2)
+    # The worker is now blocked inside _handle_play_audio -> finalize_streaming,
+    # exactly like a real client mid-STOP_AUDIO_STREAM. This must not raise.
+    await client._stop_playback_worker()
+
+    release.set()
+    print("  PASS: test_stop_playback_worker_survives_cancel_mid_final_chunk")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5b: silence elision
+# ---------------------------------------------------------------------------
+
+
+def _test_chunk_rms_stride_approximates_full_precision():
+    """The cheap stride=4 RMS used for elision stays close to the full
+    (stride=1) value calibration relies on -- close enough to gate on, not
+    identical (that's the whole point of subsampling)."""
+    from audio_gating import chunk_rms
+
+    full = chunk_rms(_LOUD_CHUNK)
+    approx = chunk_rms(_LOUD_CHUNK, stride=4)
+    assert full == 20000.0
+    assert approx == 20000.0  # constant-amplitude signal: subsampling changes nothing
+
+    assert chunk_rms(_QUIET_CHUNK, stride=4) == 0.0
+
+    print("  PASS: test_chunk_rms_stride_approximates_full_precision")
+
+
+def _test_make_audio_gap_message_shape():
+    from pi5_client import make_audio_gap, parse_message
+
+    raw = make_audio_gap(850, 12)
+    msg = parse_message(raw)
+
+    assert msg["type"] == "AUDIO_GAP"
+    assert msg["payload"]["duration_ms"] == 850
+    assert msg["payload"]["sequence_number"] == 12
+    assert msg["payload"]["reason"] == "silence"
+
+    print("  PASS: test_make_audio_gap_message_shape")
+
+
+async def _test_audio_stream_loop_flag_off_sends_all_quiet_chunks():
+    """ELIDE_SILENCE off (the default) must reproduce today's exact
+    behavior: every chunk sent as AUDIO_FRAME, even pure silence."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    client.is_recording = True
+    client._stream_to_laptop = True
+    client._audio_capture.read_chunk = _one_chunk_then_block(_QUIET_CHUNK)
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    task = asyncio.create_task(client._audio_stream_loop(ws))
+    await asyncio.sleep(0.02)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert len(sent) == 1
+    assert json.loads(sent[0])["type"] == "AUDIO_FRAME"
+
+    print("  PASS: test_audio_stream_loop_flag_off_sends_all_quiet_chunks")
+
+
+async def _test_audio_stream_loop_elides_and_flushes_gap():
+    """ELIDE_SILENCE on: quiet chunks aren't sent as AUDIO_FRAME; once enough
+    accumulates, one AUDIO_GAP flushes with the batched duration."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    client.is_recording = True
+    client._stream_to_laptop = True
+    client._audio_capture.read_chunk = _chunks_then_block([_QUIET_CHUNK] * 5)
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    with patch("pi5_client.ELIDE_SILENCE", True), \
+         patch("pi5_client.GAP_FLUSH_INTERVAL_MS", 250):
+        task = asyncio.create_task(client._audio_stream_loop(ws))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert len(sent) == 1
+    msg = json.loads(sent[0])
+    assert msg["type"] == "AUDIO_GAP"
+    assert msg["payload"]["duration_ms"] >= 250
+    assert msg["payload"]["reason"] == "silence"
+    assert msg["payload"]["sequence_number"] == 1  # no real frame sent yet
+
+    print("  PASS: test_audio_stream_loop_elides_and_flushes_gap")
+
+
+async def _test_audio_stream_loop_flushes_partial_gap_when_speech_resumes():
+    """A gap shorter than the flush interval still flushes immediately once
+    speech resumes, in order, before the resuming frame."""
+    from pi5_client import Pi5Client
+
+    client = Pi5Client("ws://test")
+    client.is_recording = True
+    client._stream_to_laptop = True
+    client._audio_capture.read_chunk = _chunks_then_block(
+        [_QUIET_CHUNK, _QUIET_CHUNK, _LOUD_CHUNK],
+    )
+
+    sent: list = []
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+
+    with patch("pi5_client.ELIDE_SILENCE", True), \
+         patch("pi5_client.GAP_FLUSH_INTERVAL_MS", 1000):  # never hit by 2 quiet chunks
+        task = asyncio.create_task(client._audio_stream_loop(ws))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert len(sent) == 2
+    gap = json.loads(sent[0])
+    frame = json.loads(sent[1])
+    assert gap["type"] == "AUDIO_GAP"
+    assert gap["payload"]["duration_ms"] == 200  # 2 quiet chunks * 100ms
+    assert gap["payload"]["sequence_number"] == 1  # predicts the frame about to send
+    assert frame["type"] == "AUDIO_FRAME"
+    assert frame["payload"]["sequence_number"] == 1
+
+    print("  PASS: test_audio_stream_loop_flushes_partial_gap_when_speech_resumes")
+
+
 def run_async_test(coro):
     asyncio.run(coro)
 
@@ -657,6 +1146,8 @@ def main():
         _test_apply_gain_scales_and_clips,
         _test_soft_limit_shape,
         _test_openai_style_loud_source_does_not_hard_clip,
+        _test_chunk_rms_stride_approximates_full_precision,
+        _test_make_audio_gap_message_shape,
     ]
     async_tests = [
         _test_audio_capture_read_chunk,
@@ -677,6 +1168,23 @@ def main():
         _test_fresh_start_runs_calibration,
         _test_drain_buffered_audio_discards_backlog,
         _test_drain_buffered_audio_noop_when_idle,
+        # Phase 5a: event-driven DEVICE_STATUS
+        _test_status_loop_silent_while_idle,
+        _test_status_loop_sends_immediately_on_recording_transitions,
+        _test_status_loop_sends_periodically_while_recording,
+        _test_start_and_stop_audio_trigger_status_event,
+        # Phase 4: binary audio framing
+        _test_handshake_negotiates_binary_audio,
+        _test_handshake_without_negotiation_stays_json,
+        _test_audio_stream_loop_sends_binary_frame_when_negotiated,
+        _test_audio_stream_loop_sends_json_frame_when_not_negotiated,
+        _test_receive_loop_queues_binary_play_audio,
+        _test_receive_loop_drops_malformed_binary_frame,
+        _test_stop_playback_worker_survives_cancel_mid_final_chunk,
+        # Phase 5b: silence elision
+        _test_audio_stream_loop_flag_off_sends_all_quiet_chunks,
+        _test_audio_stream_loop_elides_and_flushes_gap,
+        _test_audio_stream_loop_flushes_partial_gap_when_speech_resumes,
     ]
 
     total = len(sync_tests) + len(async_tests)

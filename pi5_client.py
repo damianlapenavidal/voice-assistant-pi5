@@ -13,7 +13,8 @@ The client performs the following:
   1. Connects to the app's WebSocket server
   2. Sends HELLO with device info
   3. Waits for HELLO_ACK (session config)
-  4. Enters a main loop: sends periodic DEVICE_STATUS, handles commands
+  4. Enters a main loop: sends DEVICE_STATUS on recording-state changes (and
+     periodically while recording), handles commands
   5. Reconnects with exponential backoff on disconnection
 """
 
@@ -25,13 +26,14 @@ import logging
 import os
 import platform
 import socket
+import struct
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from audio_capture import AudioCapture, AudioCaptureError, CHUNK_BYTES
-from audio_gating import AudioGating, CalibrationPhase, CalibrationStep
+from audio_gating import CHUNK_MS, AudioGating, CalibrationPhase, CalibrationStep, chunk_rms
 from audio_playback import PlaybackError, PlaybackManager
 from calibration_prompt import PROMPT_TEXT, get_calibration_prompt_pcm, prompt_asset_status
 
@@ -54,8 +56,32 @@ except ImportError:
 
 DEVICE_TYPE = "pi5"
 FIRMWARE_VERSION = "0.1.0"
-CAPABILITIES = ["audio_capture", "audio_playback"]
+CAPABILITIES = ["audio_capture", "audio_playback", "binary_audio"]
 STATUS_INTERVAL_SECONDS = 10
+
+# Phase 5b of ../voice-assistant-piZero2W/docs/battery-plan.md: elide silent
+# chunks from the stream instead of sending them, replacing long runs of
+# silence with an occasional AUDIO_GAP marker the app uses to synthesize the
+# missing audio. Off by default -- "do it last, behind a flag" per the plan.
+# The Pi 5 is mains-powered, so the win here is wire traffic and app-side work
+# rather than battery; the flag exists so it can be measured either way.
+ELIDE_SILENCE = os.getenv("ELIDE_SILENCE", "false").lower() in ("true", "1", "yes")
+GAP_FLUSH_INTERVAL_MS = 1000  # batch markers ~once/second
+
+# Binary AUDIO_FRAME/PLAY_AUDIO framing (Phase 4 of the battery plan), used
+# only once "binary_audio" is negotiated in HELLO_ACK -- see the app's
+# docs/protocol.md "Binary Audio Framing" section for the wire format. Both
+# reserved fields are earmarked for Phase 6 (barge-in echo alignment); they
+# must stay 0 until that phase assigns them meaning. These constants and the
+# struct layouts must stay byte-identical to the Zero 2 W client's, since the
+# app decodes both with the same code.
+AUDIO_FRAME_TAG = 0x01
+PLAY_AUDIO_TAG = 0x02
+HEADER_VERSION = 1
+_AUDIO_FRAME_STRUCT = struct.Struct(">BBIQI")  # tag, version, seq, ts_ms, reserved
+_PLAY_AUDIO_STRUCT = struct.Struct(">BBIBII")  # tag, version, seq, flags, duration_ms, reserved
+_FLAG_IS_FINAL = 0x01
+_DURATION_UNKNOWN = 0xFFFFFFFF
 MAX_RECONNECT_ATTEMPTS = 5
 MAX_CALIBRATION_RETRIES = 5
 MIN_PROMPT_PCM_BYTES = 4000
@@ -190,14 +216,69 @@ def make_audio_frame(
     pcm_bytes: bytes,
     sequence_number: int,
     capture_timestamp: str | None = None,
-) -> str:
-    """Create an AUDIO_FRAME message with base64-encoded PCM16 audio."""
+    *,
+    binary: bool = False,
+) -> str | bytes:
+    """Create an AUDIO_FRAME message.
+
+    JSON form (default): base64-encoded PCM16 audio, as always. Binary form
+    (only once "binary_audio" is negotiated) is a short header + raw PCM --
+    base64+JSON was measured at 26.8% wire overhead; the header is ~0.4%.
+    """
     capture_ts = capture_timestamp or utc_now_iso()
+    if binary:
+        capture_ms = int(datetime.fromisoformat(capture_ts).timestamp() * 1000)
+        header = _AUDIO_FRAME_STRUCT.pack(
+            AUDIO_FRAME_TAG, HEADER_VERSION, sequence_number & 0xFFFFFFFF, capture_ms, 0,
+        )
+        return header + pcm_bytes
     return make_message("AUDIO_FRAME", {
         "audio": base64.b64encode(pcm_bytes).decode("ascii"),
         "sequence_number": sequence_number,
         "timestamp": capture_ts,
     })
+
+
+def decode_play_audio_binary(raw: bytes) -> dict | None:
+    """Parse a binary PLAY_AUDIO frame into the same payload shape a JSON
+    PLAY_AUDIO message would produce.
+
+    Returns None (logged) on any malformed frame -- this is live audio a
+    child is listening to, so a bad frame is dropped, not a crashed session.
+    """
+    try:
+        if len(raw) < 2:
+            raise ValueError("frame shorter than 2-byte tag+version prefix")
+        tag, version = raw[0], raw[1]
+        if tag != PLAY_AUDIO_TAG:
+            raise ValueError(f"unexpected binary frame tag {tag:#04x}")
+        if version != HEADER_VERSION:
+            raise ValueError(f"unsupported PLAY_AUDIO header version {version}")
+        if len(raw) < _PLAY_AUDIO_STRUCT.size:
+            raise ValueError("truncated PLAY_AUDIO header")
+        _, _, seq, flags, duration, _ = _PLAY_AUDIO_STRUCT.unpack_from(raw, 0)
+        return {
+            "type": "PLAY_AUDIO",
+            "payload": {
+                "audio": raw[_PLAY_AUDIO_STRUCT.size:],
+                "sequence_number": seq,
+                "is_final": bool(flags & _FLAG_IS_FINAL),
+                "duration_ms": None if duration == _DURATION_UNKNOWN else duration,
+            },
+        }
+    except (struct.error, ValueError, IndexError) as exc:
+        logger.warning("Malformed binary PLAY_AUDIO frame (%s), dropping", exc)
+        return None
+
+
+def as_pcm_bytes(audio: bytes | bytearray | str | None) -> bytes:
+    """Normalize a PLAY_AUDIO payload's `audio` field to raw PCM bytes,
+    whether it arrived as base64 (JSON form) or already raw (binary form)."""
+    if audio is None:
+        return b""
+    if isinstance(audio, (bytes, bytearray)):
+        return bytes(audio)
+    return base64.b64decode(audio)
 
 
 def make_error(code: str, message: str, recoverable: bool) -> str:
@@ -214,6 +295,23 @@ def make_playback_complete(sequence_number: int, duration_ms: int) -> str:
     return make_message("PLAYBACK_COMPLETE", {
         "sequence_number": sequence_number,
         "duration_ms": duration_ms,
+    })
+
+
+def make_audio_gap(duration_ms: int, sequence_number: int, reason: str = "silence") -> str:
+    """Tell the app to synthesize duration_ms of audio before sequence_number.
+
+    `sequence_number` is the value the *next real* AUDIO_FRAME will carry --
+    elided chunks never increment it, so an unexplained jump in consecutive
+    sequence numbers still means a genuinely dropped frame; a jump preceded
+    by this marker is accounted for. `reason` is always "silence" today;
+    kept general so a future gate (e.g. non-target-speaker elision) can
+    reuse this same message type instead of inventing a second one.
+    """
+    return make_message("AUDIO_GAP", {
+        "duration_ms": duration_ms,
+        "sequence_number": sequence_number,
+        "reason": reason,
     })
 
 
@@ -239,6 +337,8 @@ class Pi5Client:
         self.server_url = server_url
         self.session_id: str | None = None
         self.is_recording = False
+        self._status_event = asyncio.Event()
+        self._binary_audio_enabled = False
         self._running = False
         self._ws = None
         self._audio_capture = AudioCapture()
@@ -249,6 +349,7 @@ class Pi5Client:
         )
         self._audio_task: asyncio.Task | None = None
         self._sequence_number = 0
+        self._elided_ms = 0.0
         self._mic_muted = False
         self._calibration_playing_prompt = False
         self._calibration_retries = 0
@@ -327,7 +428,10 @@ class Pi5Client:
 
         # --- Main loop ---
         self._running = True
-        logger.info("Entering main loop. Sending status every %ds.", STATUS_INTERVAL_SECONDS)
+        logger.info(
+            "Entering main loop. DEVICE_STATUS on recording changes, every %ds while recording.",
+            STATUS_INTERVAL_SECONDS,
+        )
 
         status_task = asyncio.create_task(self._status_loop(ws))
         try:
@@ -365,11 +469,35 @@ class Pi5Client:
             "Handshake complete! session_id=%s, audio_config=%s",
             self.session_id, audio_config,
         )
+        negotiated = payload.get("negotiated_capabilities", [])
+        self._binary_audio_enabled = "binary_audio" in negotiated
+        if self._binary_audio_enabled:
+            logger.info("Binary audio frames negotiated with the app")
 
     async def _status_loop(self, ws) -> None:
-        """Send DEVICE_STATUS messages at a regular interval."""
+        """Send DEVICE_STATUS on recording-state changes, and every
+        STATUS_INTERVAL_SECONDS while actually recording.
+
+        Idle is most of the device's life, and cpu_temp only matters mid-
+        session, so idle waits here indefinitely instead of sending an
+        unconditional heartbeat every 10 s forever. `_start_audio`/`_stop_audio`
+        set `_status_event` on every is_recording transition, which both wakes
+        an idle wait immediately and interrupts a recording-side timeout early
+        -- either way this sends a fresh status right when there's something new
+        to report, rather than up to STATUS_INTERVAL_SECONDS stale.
+        """
         while True:
-            await asyncio.sleep(STATUS_INTERVAL_SECONDS)
+            if self.is_recording:
+                try:
+                    await asyncio.wait_for(
+                        self._status_event.wait(), timeout=STATUS_INTERVAL_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await self._status_event.wait()
+            self._status_event.clear()
+
             status = make_device_status(self.is_recording)
             try:
                 await ws.send(status)
@@ -380,7 +508,16 @@ class Pi5Client:
     async def _receive_loop(self, ws) -> None:
         """Listen for messages from the app and handle commands."""
         async for raw in ws:
-            msg = parse_message(raw)
+            if isinstance(raw, (bytes, bytearray)):
+                # The only binary frames the app ever sends are PLAY_AUDIO,
+                # once negotiated (see the app's docs/protocol.md "Binary
+                # Audio Framing" section) -- a malformed one is dropped, not
+                # fatal.
+                msg = decode_play_audio_binary(raw)
+                if msg is None:
+                    continue
+            else:
+                msg = parse_message(raw)
             msg_type = msg.get("type")
             payload = msg.get("payload", {})
 
@@ -464,7 +601,9 @@ class Pi5Client:
             return
 
         self.is_recording = True
+        self._status_event.set()
         self._sequence_number = 0
+        self._elided_ms = 0.0
         self._calibration_retries = 0
         self._mic_muted = False
 
@@ -484,6 +623,7 @@ class Pi5Client:
     async def _stop_audio(self) -> None:
         """Stop capture task and terminate arecord."""
         self.is_recording = False
+        self._status_event.set()
 
         await self._stop_playback_worker()
 
@@ -547,11 +687,40 @@ class Pi5Client:
                 if not self._stream_to_laptop or self._mic_muted:
                     continue
 
-                # Stream continuous PCM including silence — OpenAI server VAD needs
-                # quiet periods after speech to detect end-of-turn.
+                # The app needs a faithful timeline of speech vs. silence --
+                # OpenAI's turn detection judges when the user is done talking
+                # from that -- so silence isn't dropped, only elided from the
+                # wire: a cheap approximate RMS (stride=4 -- full precision is
+                # calibration's job, not every streamed chunk's) gates it
+                # against the threshold calibration already measured, and long
+                # runs collapse into an occasional AUDIO_GAP marker the app
+                # re-expands into real silence before it reaches OpenAI.
+                is_silence = ELIDE_SILENCE and (
+                    chunk_rms(chunk, stride=4) < self._audio_gating.speech_start_threshold()
+                )
+
+                if is_silence:
+                    self._elided_ms += CHUNK_MS
+                    if self._elided_ms >= GAP_FLUSH_INTERVAL_MS:
+                        await ws.send(make_audio_gap(int(self._elided_ms), self._sequence_number + 1))
+                        logger.debug("Sent AUDIO_GAP (%dms elided)", int(self._elided_ms))
+                        self._elided_ms = 0.0
+                    continue
+
+                if self._elided_ms > 0:
+                    # Speech resumed with a partial gap still pending (or
+                    # elision just turned off mid-gap) -- flush it before the
+                    # resuming frame so the app hears the silence in order.
+                    await ws.send(make_audio_gap(int(self._elided_ms), self._sequence_number + 1))
+                    logger.debug("Sent AUDIO_GAP (%dms elided, resuming)", int(self._elided_ms))
+                    self._elided_ms = 0.0
+
                 self._sequence_number += 1
                 capture_ts = utc_now_iso()
-                frame = make_audio_frame(chunk, self._sequence_number, capture_ts)
+                frame = make_audio_frame(
+                    chunk, self._sequence_number, capture_ts,
+                    binary=self._binary_audio_enabled,
+                )
                 await ws.send(frame)
                 logger.debug("Sent AUDIO_FRAME #%d (%d bytes)", self._sequence_number, len(chunk))
         except ConnectionClosed:
@@ -672,8 +841,15 @@ class Pi5Client:
         exactly why it must not run on the receive loop.
         """
         assert self._playback_queue is not None
+        # Captured once: _stop_playback_worker() nils self._playback_queue
+        # before cancelling this task, so a cancellation landing mid-
+        # _handle_play_audio (e.g. inside finalize_streaming()'s subprocess
+        # wait) would otherwise hit task_done() on None instead of
+        # propagating CancelledError, crashing the client on a race that's
+        # one STOP_AUDIO_STREAM-right-after-a-final-chunk away from real.
+        queue = self._playback_queue
         while True:
-            ws, payload = await self._playback_queue.get()
+            ws, payload = await queue.get()
             try:
                 await self._handle_play_audio(ws, payload)
             except asyncio.CancelledError:
@@ -681,7 +857,7 @@ class Pi5Client:
             except Exception as exc:  # never let one frame kill playback
                 logger.error("Playback worker error: %s", exc)
             finally:
-                self._playback_queue.task_done()
+                queue.task_done()
 
     async def _stop_playback_worker(self) -> None:
         """Cancel the playback worker and drop any un-played chunks."""
@@ -698,11 +874,10 @@ class Pi5Client:
     async def _handle_play_audio(self, ws, payload: dict) -> None:
         """Decode PLAY_AUDIO payload and pipe PCM to aplay."""
         seq = payload.get("sequence_number")
-        audio_b64 = payload.get("audio", "")
         is_final = payload.get("is_final", False)
 
         try:
-            pcm_bytes = base64.b64decode(audio_b64)
+            pcm_bytes = as_pcm_bytes(payload.get("audio"))
 
             if is_final and self._playback.is_streaming:
                 if pcm_bytes:
@@ -780,6 +955,15 @@ def main():
 
     load_device_env()
 
+    # ELIDE_SILENCE is read once at import time (above) so tests can patch it
+    # as a plain module attribute -- but that means it's frozen before
+    # load_device_env() has populated os.environ from .env. Re-derive it now
+    # that .env is actually loaded, or setting it there would silently do
+    # nothing (every other .env-driven value in this file is read lazily,
+    # inside __init__ or inline, specifically to avoid this).
+    global ELIDE_SILENCE
+    ELIDE_SILENCE = os.getenv("ELIDE_SILENCE", "false").lower() in ("true", "1", "yes")
+
     logger.info("Pi 5 Voice Assistant Client v%s", FIRMWARE_VERSION)
     logger.info("Device ID: %s | Platform: %s", get_device_id(), platform.platform())
     logger.info("Target server: %s", args.server_url)
@@ -788,6 +972,7 @@ def main():
         os.environ.get("AUDIO_INPUT_DEVICE", "(default)"),
         os.environ.get("AUDIO_OUTPUT_DEVICE", "(default)"),
     )
+    logger.info("Silence elision: %s", "on" if ELIDE_SILENCE else "off")
     logger.info("Calibration prompt asset: %s", prompt_asset_status())
 
     client = Pi5Client(args.server_url)
